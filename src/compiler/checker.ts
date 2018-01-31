@@ -2424,12 +2424,15 @@ namespace ts {
             const visitedSymbolTables: SymbolTable[] = [];
             return forEachSymbolTableInScope(enclosingDeclaration, getAccessibleSymbolChainFromSymbolTable);
 
-            function getAccessibleSymbolChainFromSymbolTable(symbols: SymbolTable): Symbol[] | undefined {
+            /**
+             * @param {ignoreQualification} boolean Set when a symbol is being looked for through the exports of another symbol (meaning we have a route to qualify it already)
+             */
+            function getAccessibleSymbolChainFromSymbolTable(symbols: SymbolTable, ignoreQualification?: boolean): Symbol[] | undefined {
                 if (!pushIfUnique(visitedSymbolTables, symbols)) {
                     return undefined;
                 }
 
-                const result = trySymbolTable(symbols);
+                const result = trySymbolTable(symbols, ignoreQualification);
                 visitedSymbolTables.pop();
                 return result;
             }
@@ -2441,22 +2444,22 @@ namespace ts {
                     !!getAccessibleSymbolChain(symbolFromSymbolTable.parent, enclosingDeclaration, getQualifiedLeftMeaning(meaning), useOnlyExternalAliasing);
             }
 
-            function isAccessible(symbolFromSymbolTable: Symbol, resolvedAliasSymbol?: Symbol) {
+            function isAccessible(symbolFromSymbolTable: Symbol, resolvedAliasSymbol?: Symbol, ignoreQualification?: boolean) {
                 return symbol === (resolvedAliasSymbol || symbolFromSymbolTable) &&
                     // if the symbolFromSymbolTable is not external module (it could be if it was determined as ambient external module and would be in globals table)
                     // and if symbolFromSymbolTable or alias resolution matches the symbol,
                     // check the symbol can be qualified, it is only then this symbol is accessible
                     !some(symbolFromSymbolTable.declarations, hasExternalModuleSymbol) &&
-                    canQualifySymbol(symbolFromSymbolTable, meaning);
+                    (ignoreQualification || canQualifySymbol(symbolFromSymbolTable, meaning));
             }
 
             function isUMDExportSymbol(symbol: Symbol) {
                 return symbol && symbol.declarations && symbol.declarations[0] && isNamespaceExportDeclaration(symbol.declarations[0]);
             }
 
-            function trySymbolTable(symbols: SymbolTable) {
+            function trySymbolTable(symbols: SymbolTable, ignoreQualification: boolean | undefined) {
                 // If symbol is directly available by its name in the symbol table
-                if (isAccessible(symbols.get(symbol.escapedName))) {
+                if (isAccessible(symbols.get(symbol.escapedName), /*resolvedAliasSymbol*/ undefined, ignoreQualification)) {
                     return [symbol];
                 }
 
@@ -2469,14 +2472,14 @@ namespace ts {
                         && (!useOnlyExternalAliasing || some(symbolFromSymbolTable.declarations, isExternalModuleImportEqualsDeclaration))) {
 
                         const resolvedImportedSymbol = resolveAlias(symbolFromSymbolTable);
-                        if (isAccessible(symbolFromSymbolTable, resolvedImportedSymbol)) {
+                        if (isAccessible(symbolFromSymbolTable, resolvedImportedSymbol, ignoreQualification)) {
                             return [symbolFromSymbolTable];
                         }
 
                         // Look in the exported members, if we can find accessibleSymbolChain, symbol is accessible using this chain
                         // but only if the symbolFromSymbolTable can be qualified
                         const candidateTable = getExportsOfSymbol(resolvedImportedSymbol);
-                        const accessibleSymbolsFromExports = candidateTable && getAccessibleSymbolChainFromSymbolTable(candidateTable);
+                        const accessibleSymbolsFromExports = candidateTable && getAccessibleSymbolChainFromSymbolTable(candidateTable, /*ignoreQualification*/ true);
                         if (accessibleSymbolsFromExports && canQualifySymbol(symbolFromSymbolTable, getQualifiedLeftMeaning(meaning))) {
                             return [symbolFromSymbolTable].concat(accessibleSymbolsFromExports);
                         }
@@ -8327,11 +8330,18 @@ namespace ts {
 
         function instantiateList<T>(items: T[], mapper: TypeMapper, instantiator: (item: T, mapper: TypeMapper) => T): T[] {
             if (items && items.length) {
-                const result: T[] = [];
-                for (const v of items) {
-                    result.push(instantiator(v, mapper));
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    const mapped = instantiator(item, mapper);
+                    if (item !== mapped) {
+                        const result = i === 0 ? [] : items.slice(0, i);
+                        result.push(mapped);
+                        for (i++; i < items.length; i++) {
+                            result.push(instantiator(items[i], mapper));
+                        }
+                        return result;
+                    }
                 }
-                return result;
             }
             return items;
         }
@@ -8453,8 +8463,13 @@ namespace ts {
         }
 
         function instantiateSymbol(symbol: Symbol, mapper: TypeMapper): Symbol {
+            const links = getSymbolLinks(symbol);
+            if (links.type && !maybeTypeOfKind(links.type, TypeFlags.Object | TypeFlags.TypeVariable | TypeFlags.Index)) {
+                // If the type of the symbol is already resolved, and if that type could not possibly
+                // be affected by instantiation, simply return the symbol itself.
+                return symbol;
+            }
             if (getCheckFlags(symbol) & CheckFlags.Instantiated) {
-                const links = getSymbolLinks(symbol);
                 // If symbol being instantiated is itself a instantiation, fetch the original target and combine the
                 // type mappers. This ensures that original type identities are properly preserved and that aliases
                 // always reference a non-aliases.
@@ -8597,14 +8612,20 @@ namespace ts {
                         return getAnonymousTypeInstantiation(<MappedType>type, mapper);
                     }
                     if ((<ObjectType>type).objectFlags & ObjectFlags.Reference) {
-                        return createTypeReference((<TypeReference>type).target, instantiateTypes((<TypeReference>type).typeArguments, mapper));
+                        const typeArguments = (<TypeReference>type).typeArguments;
+                        const newTypeArguments = instantiateTypes(typeArguments, mapper);
+                        return newTypeArguments !== typeArguments ? createTypeReference((<TypeReference>type).target, newTypeArguments) : type;
                     }
                 }
                 if (type.flags & TypeFlags.Union && !(type.flags & TypeFlags.Primitive)) {
-                    return getUnionType(instantiateTypes((<UnionType>type).types, mapper), UnionReduction.Literal, type.aliasSymbol, instantiateTypes(type.aliasTypeArguments, mapper));
+                    const types = (<UnionType>type).types;
+                    const newTypes = instantiateTypes(types, mapper);
+                    return newTypes !== types ? getUnionType(newTypes, UnionReduction.Literal, type.aliasSymbol, instantiateTypes(type.aliasTypeArguments, mapper)) : type;
                 }
                 if (type.flags & TypeFlags.Intersection) {
-                    return getIntersectionType(instantiateTypes((<IntersectionType>type).types, mapper), type.aliasSymbol, instantiateTypes(type.aliasTypeArguments, mapper));
+                    const types = (<IntersectionType>type).types;
+                    const newTypes = instantiateTypes(types, mapper);
+                    return newTypes !== types ? getIntersectionType(newTypes, type.aliasSymbol, instantiateTypes(type.aliasTypeArguments, mapper)) : type;
                 }
                 if (type.flags & TypeFlags.Index) {
                     return getIndexType(instantiateType((<IndexType>type).type, mapper));
@@ -9222,7 +9243,8 @@ namespace ts {
                     isSimpleTypeRelatedTo(source, target, relation, reportErrors ? reportError : undefined)) return Ternary.True;
 
                 if (isObjectLiteralType(source) && source.flags & TypeFlags.FreshLiteral) {
-                    if (hasExcessProperties(<FreshObjectLiteralType>source, target, reportErrors)) {
+                    const discriminantType = target.flags & TypeFlags.Union ? findMatchingDiscriminantType(source, target as UnionType) : undefined;
+                    if (hasExcessProperties(<FreshObjectLiteralType>source, target, discriminantType, reportErrors)) {
                         if (reportErrors) {
                             reportRelationError(headMessage, source, target);
                         }
@@ -9232,7 +9254,7 @@ namespace ts {
                     // and intersection types are further deconstructed on the target side, we don't want to
                     // make the check again (as it might fail for a partial target type). Therefore we obtain
                     // the regular source type and proceed with that.
-                    if (isUnionOrIntersectionTypeWithoutNullableConstituents(target)) {
+                    if (isUnionOrIntersectionTypeWithoutNullableConstituents(target) && !discriminantType) {
                         source = getRegularTypeOfObjectLiteral(source);
                     }
                 }
@@ -9333,19 +9355,16 @@ namespace ts {
                 return Ternary.False;
             }
 
-            function hasExcessProperties(source: FreshObjectLiteralType, target: Type, reportErrors: boolean): boolean {
+            function hasExcessProperties(source: FreshObjectLiteralType, target: Type, discriminant: Type | undefined, reportErrors: boolean): boolean {
                 if (maybeTypeOfKind(target, TypeFlags.Object) && !(getObjectFlags(target) & ObjectFlags.ObjectLiteralPatternWithComputedProperties)) {
                     const isComparingJsxAttributes = !!(source.flags & TypeFlags.JsxAttributes);
                     if ((relation === assignableRelation || relation === comparableRelation) &&
                         (isTypeSubsetOf(globalObjectType, target) || (!isComparingJsxAttributes && isEmptyObjectType(target)))) {
                         return false;
                     }
-                    if (target.flags & TypeFlags.Union) {
-                        const discriminantType = findMatchingDiscriminantType(source, target as UnionType);
-                        if (discriminantType) {
-                            // check excess properties against discriminant type only, not the entire union
-                            return hasExcessProperties(source, discriminantType, reportErrors);
-                        }
+                    if (discriminant) {
+                        // check excess properties against discriminant type only, not the entire union
+                        return hasExcessProperties(source, discriminant, /*discriminant*/ undefined, reportErrors);
                     }
                     for (const prop of getPropertiesOfObjectType(source)) {
                         if (!isKnownProperty(target, prop.escapedName, isComparingJsxAttributes)) {
@@ -16717,7 +16736,7 @@ namespace ts {
             const isDecorator = node.kind === SyntaxKind.Decorator;
             const isJsxOpeningOrSelfClosingElement = isJsxOpeningLikeElement(node);
 
-            let typeArguments: ReadonlyArray<TypeNode>;
+            let typeArguments: NodeArray<TypeNode>;
 
             if (!isTaggedTemplate && !isDecorator && !isJsxOpeningOrSelfClosingElement) {
                 typeArguments = (<CallExpression>node).typeArguments;
@@ -16846,7 +16865,7 @@ namespace ts {
                     max = Math.max(max, length(sig.typeParameters));
                 }
                 const paramCount = min < max ? min + "-" + max : min;
-                diagnostics.add(createDiagnosticForNode(node, Diagnostics.Expected_0_type_arguments_but_got_1, paramCount, typeArguments.length));
+                diagnostics.add(createDiagnosticForNodeArray(getSourceFileOfNode(node), typeArguments, Diagnostics.Expected_0_type_arguments_but_got_1, paramCount, typeArguments.length));
             }
             else if (args) {
                 let min = Number.POSITIVE_INFINITY;
@@ -20254,6 +20273,8 @@ namespace ts {
                     case SyntaxKind.ClassDeclaration:
                     case SyntaxKind.EnumDeclaration:
                         return DeclarationSpaces.ExportType | DeclarationSpaces.ExportValue;
+                    case SyntaxKind.SourceFile:
+                        return DeclarationSpaces.ExportType | DeclarationSpaces.ExportValue | DeclarationSpaces.ExportNamespace;
                     // The below options all declare an Alias, which is allowed to merge with other values within the importing module
                     case SyntaxKind.ImportEqualsDeclaration:
                     case SyntaxKind.NamespaceImport:
@@ -20966,7 +20987,7 @@ namespace ts {
                                 error(name, Diagnostics._0_is_declared_but_its_value_is_never_read, symbolName(local));
                             }
                         }
-                        else if (compilerOptions.noUnusedLocals) {
+                        else if (local.flags & SymbolFlags.TypeParameter ? compilerOptions.noUnusedParameters : compilerOptions.noUnusedLocals) {
                             forEach(local.declarations, d => errorUnusedLocal(d, symbolName(local)));
                         }
                     }
@@ -21041,7 +21062,7 @@ namespace ts {
         }
 
         function checkUnusedTypeParameters(node: ClassDeclaration | ClassExpression | FunctionDeclaration | MethodDeclaration | FunctionExpression | ArrowFunction | ConstructorDeclaration | SignatureDeclaration | InterfaceDeclaration | TypeAliasDeclaration) {
-            if (compilerOptions.noUnusedLocals && !(node.flags & NodeFlags.Ambient)) {
+            if (compilerOptions.noUnusedParameters && !(node.flags & NodeFlags.Ambient)) {
                 if (node.typeParameters) {
                     // Only report errors on the last declaration for the type parameter container;
                     // this ensures that all uses have been accounted for.
