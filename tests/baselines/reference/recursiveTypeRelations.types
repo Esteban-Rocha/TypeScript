@@ -1,7 +1,7 @@
 === tests/cases/compiler/recursiveTypeRelations.ts ===
 // Repro from #14896
 
-type Attributes<Keys extends string> = {
+type Attributes<Keys extends keyof any> = {
 >Attributes : { [Key in Keys]: string; }
 >Keys : Keys
 
@@ -107,7 +107,7 @@ export function css<S extends { [K in keyof S]: string }>(styles: S, ...classNam
 >Object.keys : (o: {}) => string[]
 >Object : ObjectConstructor
 >keys : (o: {}) => string[]
->arg : keyof S | (object & { [K in keyof S]?: boolean; })
+>arg : object & { [K in keyof S]?: boolean; }
 >reduce : { (callbackfn: (previousValue: string, currentValue: string, currentIndex: number, array: string[]) => string): string; (callbackfn: (previousValue: string, currentValue: string, currentIndex: number, array: string[]) => string, initialValue: string): string; <U>(callbackfn: (previousValue: U, currentValue: string, currentIndex: number, array: string[]) => U, initialValue: U): U; }
 >ClassNameObject : No type information available!
 >(obj: ClassNameObject, key: keyof S) => {        const exportedClassName = styles[key];        obj[exportedClassName] = (arg as ClassNameMap<S>)[key];         return obj;      } : (obj: any, key: keyof S) => any
@@ -130,7 +130,7 @@ export function css<S extends { [K in keyof S]: string }>(styles: S, ...classNam
 >(arg as ClassNameMap<S>)[key] : { [K in keyof S]?: boolean; }[keyof S]
 >(arg as ClassNameMap<S>) : { [K in keyof S]?: boolean; }
 >arg as ClassNameMap<S> : { [K in keyof S]?: boolean; }
->arg : keyof S | (object & { [K in keyof S]?: boolean; })
+>arg : object & { [K in keyof S]?: boolean; }
 >ClassNameMap : { [K in keyof S]?: boolean; }
 >S : S
 >key : keyof S
